@@ -1,10 +1,12 @@
 import pandas as pd
 import random
 import re
+from collections import Counter
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
 import sys
+
 
 # ─────────────────────────────────────────
 # CONFIGURATION — edit these each year
@@ -16,8 +18,11 @@ MAX_GROUP_SIZE    = 16
 MAX_NE_PER_GROUP          = 10   # Northeast total
 MAX_MACT_PER_GROUP        = 6    # MA + CT specifically
 MAX_NON_NE_DOM_PER_GROUP  = 4    # Non-NE domestic
-MIN_INTL_PER_GROUP        = 1
-MAX_INTL_PER_GROUP        = 2
+# International rule: each group must have either 0 internationals, OR
+# between MIN_INTL_PER_GROUP and MAX_INTL_PER_GROUP (inclusive).
+# A group with exactly 1 international student is NOT allowed.
+MIN_INTL_PER_GROUP        = 2
+MAX_INTL_PER_GROUP        = 3
 
 NORTHEAST_STATES = {"CT", "MA", "ME", "NH", "NY", "RI", "VT"}
 MACT_STATES      = {"MA", "CT"}
@@ -32,6 +37,8 @@ COL_COUNTRY     = "Citizenship (Primary)"
 COL_HIGH_SCHOOL = "School 1 Name"
 COL_SPORT       = "Sport 1 Name"
 COL_POSSE       = "Posse"
+COL_SEX         = "Sex"   # used for the gender-ratio column in the Summary sheet
+
 
 INPUT_FILE  = sys.argv[1] if len(sys.argv) > 1 else "Fall 2026 Orientation Group Assignment FY 20260526-100456.xlsx"
 OUTPUT_FILE = "orientation_groups_49.xlsx"
@@ -200,6 +207,8 @@ def empty_group():
     }
 
 
+
+
 # ─────────────────────────────────────────
 # STEP 4: CONSTRAINT CHECK
 # ─────────────────────────────────────────
@@ -286,33 +295,269 @@ def greedy_assign(df, groups):
 
     return unassigned
 def fix_international_minimums(df, groups):
+    """
+    Enforce the rule: each group has either 0 internationals, OR between
+    MIN_INTL_PER_GROUP and MAX_INTL_PER_GROUP. A group with exactly 1
+    international student is invalid.
+
+    Strategy for each invalid group (0 < intl < MIN_INTL_PER_GROUP):
+      1. Try to *raise* it to MIN by pulling an international from a donor
+         group that has > MIN (so the donor stays valid).
+      2. If that fails, *drain* it to 0 by pushing its lone international
+         into a donor group that currently has ≥ MIN-1 (so the donor lands
+         in the valid 2–3 range) — only if the receiving group can accept.
+    """
+    def try_raise(g_idx, group):
+        for h_idx, donor in enumerate(groups):
+            if h_idx == g_idx or donor["intl"] <= MIN_INTL_PER_GROUP:
+                continue
+            for s_idx in donor["students"][:]:
+                student = df.loc[s_idx]
+                if not student["is_international"]:
+                    continue
+                remove_student(student, donor)
+                if can_assign(student, group):
+                    assign_student(student, group)
+                    return True
+                assign_student(student, donor)  # restore
+        return False
+
+    def try_drain(g_idx, group):
+        # Move every international out of this group into a group that
+        # currently has between MIN-1 and MAX-1 internationals (so it stays
+        # valid after gaining one).
+        for s_idx in group["students"][:]:
+            student = df.loc[s_idx]
+            if not student["is_international"]:
+                continue
+            remove_student(student, group)
+            placed = False
+            for h_idx, receiver in enumerate(groups):
+                if h_idx == g_idx:
+                    continue
+                if not (MIN_INTL_PER_GROUP - 1 <= receiver["intl"] < MAX_INTL_PER_GROUP):
+                    continue
+                if can_assign(student, receiver):
+                    assign_student(student, receiver)
+                    placed = True
+                    break
+            if not placed:
+                # Put her back; we can't fully drain
+                assign_student(student, group)
+                return False
+        return True
+
     for g_idx, group in enumerate(groups):
         attempts = 0
-        while group["intl"] < MIN_INTL_PER_GROUP and attempts < NUM_GROUPS:
+        while 0 < group["intl"] < MIN_INTL_PER_GROUP and attempts < NUM_GROUPS:
             attempts += 1
-            swapped = False
-            for h_idx, donor in enumerate(groups):
-                if h_idx == g_idx or donor["intl"] <= MIN_INTL_PER_GROUP:
+            if try_raise(g_idx, group):
+                continue
+            if try_drain(g_idx, group):
+                break
+            # Neither move possible — leave it for validation to flag
+            break
+
+
+
+# ─────────────────────────────────────────
+# STEP 6a: NON-NE DOMESTIC OVERFLOW FIX
+# If any group is over MAX_NON_NE_DOM_PER_GROUP, try to relocate one of its
+# non-NE-domestic students into another group that still has room.
+# Pure swap — does not bend constraints.
+# ─────────────────────────────────────────
+def try_swap_nonNE(df, groups):
+    """
+    For groups over the non-NE domestic cap, attempt a swap to resolve.
+    Also handles state-duplicate soft-placements by trying a two-level swap.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for g_idx, group in enumerate(groups):
+            if group["nonNE_dom"] <= MAX_NON_NE_DOM_PER_GROUP:
+                continue
+            # Try moving each non-NE domestic student out of the overfull group
+            for s_idx in group["students"][:]:
+                student = df.loc[s_idx]
+                if not student["is_nonNE_domestic"]:
                     continue
-                for s_idx in donor["students"][:]:
-                    student = df.loc[s_idx]
-                    if not student["is_international"]:
+                remove_student(student, group)
+                placed = False
+                for h_idx, receiver in enumerate(groups):
+                    if h_idx == g_idx:
                         continue
-                    remove_student(student, donor)
-                    if can_assign(student, group):
-                        assign_student(student, group)
-                        swapped = True
+                    if receiver["nonNE_dom"] >= MAX_NON_NE_DOM_PER_GROUP:
+                        continue
+                    if can_assign(student, receiver):
+                        assign_student(student, receiver)
+                        print(f"   ↳ Swapped {df.loc[s_idx]['First']} {df.loc[s_idx]['Last']} "
+                              f"Group {g_idx+1} → Group {h_idx+1} (nonNE_dom fix)")
+                        placed = True
+                        changed = True
                         break
-                    else:
-                        assign_student(student, donor)  
-                if swapped:
+                if not placed:
+                    assign_student(student, group)  # restore
+                if group["nonNE_dom"] <= MAX_NON_NE_DOM_PER_GROUP:
                     break
-            if not swapped:
-                break  
+
+
+def chain_swap_dup_state(df, groups, max_passes=5):
+    """
+    Resolve duplicate non-NE state violations using a 2-hop chain swap.
+
+    For each group G_src that has duplicate state S:
+      1. Try a direct 1-hop move (same as fix_dup_state_via_swap).
+      2. If that fails, look for an intermediate group G_mid that has room
+         for one of G_src's duplicate-state students AND a current member Y
+         we can re-home into a third group G_dst (cleanly). Then:
+            - Move Y from G_mid → G_dst
+            - Move X from G_src → G_mid
+         The net effect is: G_src loses a duplicate, G_mid stays balanced,
+         G_dst gains one student. No constraint is bent.
+
+    Repeats until no progress is made or max_passes is hit.
+    """
+    for _ in range(max_passes):
+        changed = False
+        for g_src, group in enumerate(groups):
+            # Find a duplicate state in this group
+            state_counts = {}
+            for s_idx in group["students"]:
+                s = df.loc[s_idx]
+                if s["is_nonNE_domestic"] and s["_state_code"]:
+                    state_counts[s["_state_code"]] = state_counts.get(s["_state_code"], 0) + 1
+            dup_states = [st for st, c in state_counts.items() if c > 1]
+            if not dup_states:
+                continue
+
+            for dup_state in dup_states:
+                # Collect duplicate students in source group
+                candidates_x = [
+                    s_idx for s_idx in group["students"][:]
+                    if df.loc[s_idx]["is_nonNE_domestic"]
+                    and df.loc[s_idx]["_state_code"] == dup_state
+                ]
+                resolved = False
+                for x_idx in candidates_x:
+                    X = df.loc[x_idx]
+
+                    # ── Try a 1-hop direct move first ──
+                    remove_student(X, group)
+                    for g_dst, dst in enumerate(groups):
+                        if g_dst == g_src:
+                            continue
+                        if can_assign(X, dst):
+                            assign_student(X, dst)
+                            print(f"   ↳ Direct-moved {X['First']} {X['Last']} "
+                                  f"Group {g_src+1} → Group {g_dst+1} "
+                                  f"(dup {dup_state} fix)")
+                            resolved = True
+                            changed = True
+                            break
+                    if resolved:
+                        break
+
+                    # ── 2-hop chain swap ──
+                    for g_mid, mid in enumerate(groups):
+                        if g_mid == g_src:
+                            continue
+                        # G_mid must currently *not* accept X (otherwise 1-hop would have worked)
+                        # but should become acceptable if we remove a current member Y.
+                        for y_idx in mid["students"][:]:
+                            Y = df.loc[y_idx]
+                            # Don't shuffle posse / international students lightly
+                            remove_student(Y, mid)
+                            if not can_assign(X, mid):
+                                assign_student(Y, mid)
+                                continue
+                            # X could go to G_mid if we re-home Y. Find a third group.
+                            placed_y = False
+                            for g_dst, dst in enumerate(groups):
+                                if g_dst in (g_src, g_mid):
+                                    continue
+                                if can_assign(Y, dst):
+                                    assign_student(Y, dst)
+                                    assign_student(X, mid)
+                                    print(f"   ↳ Chain-swapped: {X['First']} {X['Last']} "
+                                          f"Group {g_src+1} → Group {g_mid+1}, "
+                                          f"{Y['First']} {Y['Last']} "
+                                          f"Group {g_mid+1} → Group {g_dst+1} "
+                                          f"(dup {dup_state} fix)")
+                                    placed_y = True
+                                    break
+                            if placed_y:
+                                resolved = True
+                                changed = True
+                                break
+                            # restore Y and try the next member
+                            assign_student(Y, mid)
+                        if resolved:
+                            break
+                    if resolved:
+                        break
+
+                    # Couldn't resolve via this X — restore it and try the next
+                    assign_student(X, group)
+
+                if resolved:
+                    break  # re-scan from the top after a change
+            if changed:
+                break
+        if not changed:
+            return
+
+
+def fix_dup_state_via_swap(df, groups, unassigned):
+
+    """
+    After soft-placement, if a student landed with a duplicate state,
+    try a chain swap: find someone in that group with a different state
+    who can move elsewhere, freeing a clean slot.
+    """
+    for idx in list(unassigned):
+        # unassigned is already empty at this point; we check violations instead
+        pass
+
+    # Check all groups for duplicate non-NE states
+    for g_idx, group in enumerate(groups):
+        state_counts = {}
+        for s_idx in group["students"]:
+            s = df.loc[s_idx]
+            if s["is_nonNE_domestic"] and s["_state_code"]:
+                state_counts[s["_state_code"]] = state_counts.get(s["_state_code"], 0) + 1
+
+        for dup_state, count in state_counts.items():
+            if count < 2:
+                continue
+            # Find one of the duplicates to move out
+            for s_idx in group["students"][:]:
+                student = df.loc[s_idx]
+                if not student["is_nonNE_domestic"] or student["_state_code"] != dup_state:
+                    continue
+                remove_student(student, group)
+                placed = False
+                for h_idx, receiver in enumerate(groups):
+                    if h_idx == g_idx:
+                        continue
+                    if receiver["nonNE_dom"] >= MAX_NON_NE_DOM_PER_GROUP:
+                        continue
+                    if can_assign(student, receiver):
+                        assign_student(student, receiver)
+                        print(f"   ↳ Moved {df.loc[s_idx]['First']} {df.loc[s_idx]['Last']} "
+                              f"Group {g_idx+1} → Group {h_idx+1} (dup state {dup_state} fix)")
+                        placed = True
+                        break
+                if not placed:
+                    assign_student(student, group)  # restore
+                else:
+                    break  # one move per duplicate per pass; re-validate after
+
 
 
 # ─────────────────────────────────────────
 # STEP 6c: SOFT-RELAXATION PASS
+
 # Place any remaining unassigned students into the *least disruptive* group
 # by scoring each group's constraint violations and picking the lowest.
 # ─────────────────────────────────────────
@@ -327,8 +572,9 @@ _PENALTY = {
     "dup_country":    30,
     "dup_posse":      25,
     "dup_sport":      20,
-    "nonNE_cap":      10,    # softest cap — bumping 4 → 5 is acceptable
+    "nonNE_cap":  10_000,    # hard — same as size_hard
 }
+
 
 def soft_score(student, group):
     """Return (total_penalty, [reasons]) for placing `student` in `group`."""
@@ -401,8 +647,13 @@ def validate_groups(df, groups):
             violations.append(f"Group {g_num}: nonNE_dom={group['nonNE_dom']} > {MAX_NON_NE_DOM_PER_GROUP}")
         if group["intl"] > MAX_INTL_PER_GROUP:
             violations.append(f"Group {g_num}: intl={group['intl']} > {MAX_INTL_PER_GROUP}")
-        if group["intl"] < MIN_INTL_PER_GROUP:
-            violations.append(f"Group {g_num}: intl={group['intl']} < {MIN_INTL_PER_GROUP} (min)")
+        # Rule: intl must be 0 OR in [MIN, MAX]. Exactly 1 (or any 1..MIN-1) is invalid.
+        if 0 < group["intl"] < MIN_INTL_PER_GROUP:
+            violations.append(
+                f"Group {g_num}: intl={group['intl']} (must be 0 or "
+                f"{MIN_INTL_PER_GROUP}–{MAX_INTL_PER_GROUP})"
+            )
+
 
         # uniqueness checks
         seen = {"nonNE_state": [], "intl_country": [], "hs": [], "sport": [], "posse": []}
@@ -452,9 +703,43 @@ def write_output(df, groups, unassigned, violations):
         )
         master_df.to_excel(writer, sheet_name="Master", index=False)
 
+        # ── Gender helpers ─────────────────────────────────────
+        # The Sex column should be 'F' / 'M' for everyone. Anything else (blank,
+        # weird casing, free-text Gender Identity etc.) is bucketed as "Other".
+        def _sex_label(raw):
+            if raw is None:
+                return "Other"
+            s = str(raw).strip().upper()
+            if s in ("F", "FEMALE"):
+                return "F"
+            if s in ("M", "MALE"):
+                return "M"
+            return "Other"
+
+        def gender_counts(student_indices):
+            f = m = o = 0
+            for s_idx in student_indices:
+                val = df.loc[s_idx].get(COL_SEX, "") if COL_SEX in df.columns else ""
+                lab = _sex_label(val)
+                if   lab == "F": f += 1
+                elif lab == "M": m += 1
+                else:            o += 1
+            return f, m, o
+
+        def fmt_ratio(f, m):
+            # "F:M ratio (F%)" — e.g. "7:6 (54% F)"
+            tot = f + m
+            if tot == 0:
+                return "—"
+            pct = round(100 * f / tot)
+            return f"{f}:{m} ({pct}% F)"
+
         # Summary sheet
         summary_rows = []
+        all_f = all_m = all_o = 0
         for g_num, group in enumerate(groups, start=1):
+            f, m, o = gender_counts(group["students"])
+            all_f += f; all_m += m; all_o += o
             summary_rows.append({
                 "Group":            g_num,
                 "Total Students":   group["total"],
@@ -462,10 +747,30 @@ def write_output(df, groups, unassigned, violations):
                 "MA/CT Students":   group["mact"],
                 "Non-NE Domestic":  group["nonNE_dom"],
                 "International":    group["intl"],
-                "Intl OK":          "✓" if group["intl"] >= MIN_INTL_PER_GROUP else "⚠ BELOW MIN",
+                "Female":           f,
+                "Male":             m,
+                "Other / Unknown":  o,
+                "F:M Ratio":        fmt_ratio(f, m),
+                "Intl OK":          "✓" if (group["intl"] == 0 or group["intl"] >= MIN_INTL_PER_GROUP) else "⚠ INVALID (1)",
                 "Size OK":          "✓" if MIN_GROUP_SIZE <= group["total"] <= MAX_GROUP_SIZE else "⚠",
             })
+        # Totals row across the whole cohort
+        summary_rows.append({
+            "Group":            "TOTAL",
+            "Total Students":   sum(g["total"]    for g in groups),
+            "NE Students":      sum(g["ne"]       for g in groups),
+            "MA/CT Students":   sum(g["mact"]     for g in groups),
+            "Non-NE Domestic":  sum(g["nonNE_dom"] for g in groups),
+            "International":    sum(g["intl"]    for g in groups),
+            "Female":           all_f,
+            "Male":             all_m,
+            "Other / Unknown":  all_o,
+            "F:M Ratio":        fmt_ratio(all_f, all_m),
+            "Intl OK":          "",
+            "Size OK":          "",
+        })
         pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Summary", index=False)
+
 
         # One sheet per group
         for g_num, group in enumerate(groups, start=1):
@@ -503,9 +808,11 @@ def write_output(df, groups, unassigned, violations):
     print(f"   Groups created:       {NUM_GROUPS}")
     print(f"   Students assigned:    {sum(g['total'] for g in groups)}")
     print(f"   Unassigned (manual):  {len(unassigned)}")
-    intl_warnings = [i+1 for i, g in enumerate(groups) if g["intl"] < MIN_INTL_PER_GROUP]
+    intl_warnings = [i+1 for i, g in enumerate(groups) if 0 < g["intl"] < MIN_INTL_PER_GROUP]
     if intl_warnings:
-        print(f"   ⚠ Groups below intl minimum: {intl_warnings}")
+        print(f"   ⚠ Groups with an invalid intl count (must be 0 or "
+              f"{MIN_INTL_PER_GROUP}–{MAX_INTL_PER_GROUP}): {intl_warnings}")
+
     if violations:
         print(f"   ⚠ {len(violations)} validation issue(s) — see 'Violations' sheet")
 
@@ -546,11 +853,25 @@ if __name__ == "__main__":
     print("Fixing international minimums...")
     fix_international_minimums(df, groups)
 
+    # ── NEW: fix nonNE_dom overflows before soft-placing ──
+    print("Fixing non-NE domestic overflows...")
+    try_swap_nonNE(df, groups)
+
     if unassigned:
         print(f"Soft-placing {len(unassigned)} remaining student(s) into best-fit groups...")
         soft_place_remaining(df, unassigned, groups)
 
+    # ── NEW: clean up any duplicate-state side effects from soft-placement ──
+    print("Fixing duplicate-state placements via 1-hop swap...")
+    fix_dup_state_via_swap(df, groups, unassigned)
+
+    # ── NEW: 2-hop chain swap for any duplicate state the 1-hop pass couldn't fix
+    print("Fixing remaining duplicate-state placements via chain swap...")
+    chain_swap_dup_state(df, groups)
+
     print("Validating...")
+
+
     violations = validate_groups(df, groups)
     for v in violations:
         print(f"   ⚠ {v}")

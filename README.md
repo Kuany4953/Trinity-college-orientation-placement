@@ -21,8 +21,13 @@ Given an Excel roster of admitted students, it produces:
 | Northeast (CT, MA, ME, NH, NY, RI, VT) per group | ≤ 10 |
 | MA + CT per group | ≤ 6 |
 | Non-NE domestic per group | ≤ 4 |
-| International per group | 2–3 |
+| International per group | 0 OR 2–3 (exactly 1 is invalid) |
 | Duplicate state (non-NE) / country / high school / sport / Posse cohort | forbidden |
+
+> The international rule means a group is allowed to have **no** internationals
+> at all, but if it has any, it must have at least 2 and at most 3. A group
+> with exactly one international student is rejected.
+
 
 Place-difficulty order (hardest first → easiest last):
 **Posse → International → Non-NE Domestic → MA/CT → Other Northeast.**
@@ -34,8 +39,12 @@ Place-difficulty order (hardest first → easiest last):
 2. **Sort** students by placement difficulty.
 3. **Greedy assignment** — for each student, try every group (smallest-first,
    shuffled within ties) and pick the first that satisfies all constraints.
-4. **International min fix-up** — if a group has < 2 international students,
-   try to swap one in from a donor group that has ≥ 3.
+4. **International fix-up** — if a group has exactly 1 international student
+   (invalid), first try to raise it to 2 by pulling one in from a donor group
+   that has ≥ 3. If no donor can spare one, drain that lone international out
+   to a group that currently has 1–2 internationals (so the receiver lands at
+   the valid 2–3), bringing the original group to a valid 0.
+
 5. **Soft-relaxation pass** — if any students are still unassigned (because the
    hard caps are mathematically tight), each is placed in the group with the
    lowest "disruption score" (weighted penalty per relaxed constraint).
